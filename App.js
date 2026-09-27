@@ -3,7 +3,8 @@
  * A simple React Native app to log and track job applications:
  * company, role, status, date applied, and notes.
  *
- * Stack: React Native (CLI or Expo) + AsyncStorage for local persistence.
+ * Stack: React Native (Expo) + Firebase Firestore for cloud persistence
+ * (real-time sync via onSnapshot — no manual save/load needed).
  * Author: Tejaswi Sai Gadadasu
  */
 
@@ -20,12 +21,24 @@ import {
   Platform,
   KeyboardAvoidingView,
   ScrollView,
+  ActivityIndicator,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import DateTimePicker from '@react-native-community/datetimepicker';
+import {
+  collection,
+  onSnapshot,
+  addDoc,
+  updateDoc,
+  deleteDoc,
+  doc,
+  orderBy,
+  query,
+} from 'firebase/firestore';
+import { signInAnonymously, onAuthStateChanged } from 'firebase/auth';
+import { db, auth } from './firebaseConfig';
 
-const STORAGE_KEY = '@job_applications';
+const APPLICATIONS_COLLECTION = 'applications';
 const STATUS_OPTIONS = ['Applied', 'Interview', 'Offer', 'Rejected'];
 
 const emptyForm = {
@@ -42,25 +55,54 @@ export default function App() {
   const [editingId, setEditingId] = useState(null);
   const [form, setForm] = useState(emptyForm);
   const [showDatePicker, setShowDatePicker] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [syncError, setSyncError] = useState(null);
+  const [authReady, setAuthReady] = useState(false);
 
-  // Load saved applications on first render
+  // Silently sign in anonymously on launch. This gives the app a valid
+  // request.auth for Firestore's security rules to check, with no login
+  // screen ever shown to the user.
   useEffect(() => {
-    (async () => {
-      try {
-        const raw = await AsyncStorage.getItem(STORAGE_KEY);
-        if (raw) setApplications(JSON.parse(raw));
-      } catch (e) {
-        console.warn('Failed to load applications', e);
+    const unsubscribeAuth = onAuthStateChanged(auth, (user) => {
+      if (user) {
+        setAuthReady(true);
+      } else {
+        signInAnonymously(auth).catch((e) => {
+          console.warn('Anonymous sign-in failed', e);
+          setSyncError('Unable to authenticate with the server.');
+          setLoading(false);
+        });
       }
-    })();
+    });
+    return unsubscribeAuth;
   }, []);
 
-  // Persist whenever the list changes
+  // Subscribe to Firestore in real time, but only once auth is ready —
+  // otherwise the very first read would be rejected by security rules
+  // that require request.auth != null. This replaces the old
+  // load-once-on-mount + save-on-every-change AsyncStorage pattern.
   useEffect(() => {
-    AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(applications)).catch((e) =>
-      console.warn('Failed to save applications', e)
+    if (!authReady) return;
+
+    const q = query(collection(db, APPLICATIONS_COLLECTION), orderBy('dateApplied', 'desc'));
+    const unsubscribe = onSnapshot(
+      q,
+      (snapshot) => {
+        const docs = snapshot.docs.map((d) => ({ id: d.id, ...d.data() }));
+        setApplications(docs);
+        setLoading(false);
+        setSyncError(null);
+      },
+      (error) => {
+        console.warn('Firestore sync failed', error);
+        setSyncError('Unable to sync with the server. Check your connection.');
+        setLoading(false);
+      }
     );
-  }, [applications]);
+    // Unsubscribe when the component unmounts, so we don't leak a
+    // live listener after the app is closed.
+    return unsubscribe;
+  }, [authReady]);
 
   const openAddModal = useCallback(() => {
     setEditingId(null);
@@ -74,19 +116,29 @@ export default function App() {
     setModalVisible(true);
   }, []);
 
-  const saveApplication = useCallback(() => {
+  const saveApplication = useCallback(async () => {
     if (!form.company.trim() || !form.role.trim()) {
       Alert.alert('Missing info', 'Company and role are required.');
       return;
     }
-    if (editingId) {
-      setApplications((prev) =>
-        prev.map((a) => (a.id === editingId ? { ...form, id: editingId } : a))
-      );
-    } else {
-      setApplications((prev) => [...prev, { ...form, id: Date.now().toString() }]);
+    // Strip the local 'id' field before writing — Firestore manages
+    // document ids itself, so we never want to write our own into the
+    // document body (it'd just be a leftover, unused field there).
+    const { id, ...formData } = form;
+
+    try {
+      if (editingId) {
+        await updateDoc(doc(db, APPLICATIONS_COLLECTION, editingId), formData);
+      } else {
+        await addDoc(collection(db, APPLICATIONS_COLLECTION), formData);
+      }
+      setModalVisible(false);
+      // No local state update needed here — the onSnapshot listener
+      // above will pick up this change automatically and re-render.
+    } catch (e) {
+      console.warn('Failed to save application', e);
+      Alert.alert('Save failed', 'Could not save to the server. Please try again.');
     }
-    setModalVisible(false);
   }, [form, editingId]);
 
   const deleteApplication = useCallback((id) => {
@@ -95,7 +147,14 @@ export default function App() {
       {
         text: 'Delete',
         style: 'destructive',
-        onPress: () => setApplications((prev) => prev.filter((a) => a.id !== id)),
+        onPress: async () => {
+          try {
+            await deleteDoc(doc(db, APPLICATIONS_COLLECTION, id));
+          } catch (e) {
+            console.warn('Failed to delete application', e);
+            Alert.alert('Delete failed', 'Could not delete from the server. Please try again.');
+          }
+        },
       },
     ]);
   }, []);
@@ -143,15 +202,28 @@ export default function App() {
         </TouchableOpacity>
       </View>
 
-      <FlatList
-        data={applications}
-        keyExtractor={(item) => item.id}
-        renderItem={renderItem}
-        contentContainerStyle={{ paddingBottom: 24 }}
-        ListEmptyComponent={
-          <Text style={styles.empty}>No applications logged yet. Tap "+ Add" to start.</Text>
-        }
-      />
+      {!!syncError && (
+        <View style={styles.errorBanner}>
+          <Text style={styles.errorBannerText}>{syncError}</Text>
+        </View>
+      )}
+
+      {loading ? (
+        <View style={styles.centered}>
+          <ActivityIndicator color="#2F6FED" size="large" />
+          <Text style={styles.loadingText}>Syncing with the server...</Text>
+        </View>
+      ) : (
+        <FlatList
+          data={applications}
+          keyExtractor={(item) => item.id}
+          renderItem={renderItem}
+          contentContainerStyle={{ paddingBottom: 24 }}
+          ListEmptyComponent={
+            <Text style={styles.empty}>No applications logged yet. Tap "+ Add" to start.</Text>
+          }
+        />
+      )}
 
       <Modal visible={modalVisible} animationType="slide" transparent>
         <KeyboardAvoidingView
@@ -256,7 +328,7 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     alignItems: 'center',
     paddingHorizontal: 16,
-    paddingTop: 22,
+    paddingTop: 20,
     paddingBottom: 12,
   },
   title: { fontSize: 20, fontWeight: '700', color: '#1F2430' },
@@ -294,6 +366,16 @@ const styles = StyleSheet.create({
   dateDoneBtn: { alignSelf: 'flex-end', paddingVertical: 8, paddingHorizontal: 4, marginBottom: 6 },
   dateDoneText: { color: '#2F6FED', fontWeight: '700', fontSize: 14 },
   empty: { textAlign: 'center', color: '#8A8F9C', marginTop: 40 },
+  centered: { flex: 1, justifyContent: 'center', alignItems: 'center' },
+  loadingText: { marginTop: 12, color: '#8A8F9C', fontSize: 13 },
+  errorBanner: {
+    backgroundColor: '#FDE7E7',
+    marginHorizontal: 16,
+    marginBottom: 8,
+    padding: 10,
+    borderRadius: 8,
+  },
+  errorBannerText: { color: '#C0392B', fontSize: 12, textAlign: 'center' },
   modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.4)', justifyContent: 'flex-end' },
   modalContent: {
     backgroundColor: '#fff',

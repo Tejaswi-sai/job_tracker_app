@@ -1,0 +1,22 @@
+rules_version = '2';
+
+// These rules require the request to come from a signed-in session
+// (anonymous sign-in counts) before allowing any read or write. This
+// blocks someone from grabbing the app's Firebase config and hitting
+// the database directly with no app installed at all — the previous
+// "test mode" rules allowed exactly that.
+//
+// This is appropriate for a single-user portfolio demo. It does NOT
+// separate data by user (every anonymous session sees the same shared
+// 'applications' collection) — for a real multi-user product, you'd
+// add a per-document 'ownerId' field and scope rules to
+// request.auth.uid == resource.data.ownerId instead.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /applications/{applicationId} {
+      allow read, write: if request.auth != null;
+    }
+  }
+}
+
